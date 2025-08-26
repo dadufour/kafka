@@ -254,6 +254,10 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     numThreads
   }
 
+  /************* Failover Configuration ***********/
+  val failoverMode = getString(ServerConfigs.FAILOVER_MODE_CONFIG)
+  val failoverListeners = getString(ServerConfigs.FAILOVER_LISTENERS_CONFIG)
+
   /************* Metadata Configuration ***********/
   val metadataSnapshotMaxNewRecordBytes = getLong(MetadataLogConfig.METADATA_SNAPSHOT_MAX_NEW_RECORD_BYTES_CONFIG)
   val metadataSnapshotMaxIntervalMs = getLong(MetadataLogConfig.METADATA_SNAPSHOT_MAX_INTERVAL_MS_CONFIG)

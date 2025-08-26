@@ -99,6 +99,7 @@ object DynamicBrokerConfig {
     SocketServer.ReconfigurableConfigs ++
     DynamicProducerStateManagerConfig ++
     DynamicRemoteLogConfig.ReconfigurableConfigs ++
+    DynamicKafkaApiConfig.ReconfigurableConfigs ++
     Set(AbstractConfig.CONFIG_PROVIDERS_CONFIG)
 
   private val ClusterLevelListenerConfigs = Set(SocketServerConfigs.MAX_CONNECTIONS_CONFIG, SocketServerConfigs.MAX_CONNECTION_CREATION_RATE_CONFIG, SocketServerConfigs.NUM_NETWORK_THREADS_CONFIG)
@@ -307,6 +308,7 @@ class DynamicBrokerConfig(private val kafkaConfig: KafkaConfig) extends Logging 
     addBrokerReconfigurable(kafkaServer.socketServer)
     addBrokerReconfigurable(new DynamicProducerStateManagerConfig(kafkaServer.logManager.producerStateManagerConfig))
     addBrokerReconfigurable(new DynamicRemoteLogConfig(kafkaServer))
+    addBrokerReconfigurable(new DynamicKafkaApiConfig(kafkaServer.dataPlaneRequestProcessor))
   }
 
   /**
@@ -1125,4 +1127,28 @@ object DynamicRemoteLogConfig {
     RemoteLogManagerConfig.REMOTE_LOG_MANAGER_FOLLOWER_THREAD_POOL_SIZE_PROP,
     RemoteLogManagerConfig.REMOTE_LOG_READER_THREADS_PROP
   )
+}
+
+object DynamicKafkaApiConfig {
+  val ReconfigurableConfigs = Set(
+    ServerConfigs.FAILOVER_MODE_CONFIG
+  )
+}
+
+class DynamicKafkaApiConfig(server: KafkaApis) extends BrokerReconfigurable with Logging {
+
+  override def reconfigurableConfigs: Set[String] = {
+    DynamicKafkaApiConfig.ReconfigurableConfigs
+  }
+
+  override def validateReconfiguration(newConfig: KafkaConfig): Unit = {
+  }
+
+  override def reconfigure(oldConfig: KafkaConfig, newConfig: KafkaConfig): Unit = {
+
+    if (oldConfig.failoverMode != newConfig.failoverMode) {
+      info(s"Dynamically changed failover mode configuration from ${oldConfig.failoverMode} to ${newConfig.failoverMode}")
+      server.reconfigure(newConfig);
+    }
+  }
 }

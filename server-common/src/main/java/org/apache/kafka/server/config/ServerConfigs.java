@@ -114,6 +114,15 @@ public class ServerConfigs {
     public static final String UNSTABLE_API_VERSIONS_ENABLE_CONFIG = "unstable.api.versions.enable";
     public static final String UNSTABLE_FEATURE_VERSIONS_ENABLE_CONFIG = "unstable.feature.versions.enable";
 
+    /** Failover Configurations **/
+    public static final String FAILOVER_MODE_CONFIG = "failover.mode";
+    public static final String FAILOVER_MODE_DEFAULT = "ACTIVE";
+    public static final String FAILOVER_MODE_DOC = "Active/Standby mode - can be one of ACTIVE | STANDBY | ACTIVATING | EVACUATING";
+
+    public static final String FAILOVER_LISTENERS_CONFIG = "failover.listeners";
+    public static final String FAILOVER_LISTENERS_DEFAULT = "";
+    public static final String FAILOVER_LISTENERS_DOC = "Listeners subject to Active/Standby mode";
+
     /************* Authorizer Configuration ***********/
     public static final String AUTHORIZER_CLASS_NAME_CONFIG = "authorizer.class.name";
     public static final String AUTHORIZER_CLASS_NAME_DEFAULT = "";
@@ -134,6 +143,9 @@ public class ServerConfigs {
             .define(SOCKET_CONNECTION_SETUP_TIMEOUT_MS_CONFIG, LONG, DEFAULT_SOCKET_CONNECTION_SETUP_TIMEOUT_MS, MEDIUM, SOCKET_CONNECTION_SETUP_TIMEOUT_MS_DOC)
             .define(SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_CONFIG, LONG, SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS, MEDIUM, SOCKET_CONNECTION_SETUP_TIMEOUT_MAX_MS_DOC)
             .define(CONFIG_PROVIDERS_CONFIG, ConfigDef.Type.LIST, List.of(), ConfigDef.Importance.LOW, CONFIG_PROVIDERS_DOC)
+            /************* Failover Configuration ***********/
+            .define(FAILOVER_MODE_CONFIG, STRING, FAILOVER_MODE_DEFAULT, HIGH, FAILOVER_MODE_DOC)
+            .define(FAILOVER_LISTENERS_CONFIG, STRING, FAILOVER_LISTENERS_DEFAULT, HIGH, FAILOVER_LISTENERS_DOC)
             /************* Authorizer Configuration ***********/
             .define(AUTHORIZER_CLASS_NAME_CONFIG, STRING, AUTHORIZER_CLASS_NAME_DEFAULT, new ConfigDef.NonNullValidator(), LOW, AUTHORIZER_CLASS_NAME_DOC)
             .define(EARLY_START_LISTENERS_CONFIG, STRING, null,  HIGH, EARLY_START_LISTENERS_DOC)

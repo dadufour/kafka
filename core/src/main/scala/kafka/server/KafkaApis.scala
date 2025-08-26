@@ -123,10 +123,31 @@ class KafkaApis(val requestChannel: RequestChannel,
   val configManager = new ConfigAdminManager(brokerId, config, configRepository)
   val describeTopicPartitionsRequestHandler = new DescribeTopicPartitionsRequestHandler(
     metadataCache, authHelper, config)
+  private var failoverMode = config.failoverMode
 
   def close(): Unit = {
     aclApis.close()
     info("Shutdown complete.")
+  }
+
+  private[server] def reconfigure(newConfig: KafkaConfig): Unit = {
+    failoverMode = newConfig.failoverMode
+  }
+  
+  private def isFailoverListener(request: RequestChannel.Request): Boolean = {
+    
+    val listeners = config.failoverListeners
+
+    val items = listeners.split(",")
+    items.exists(listener => request.context.listenerName.value().compareTo(listener) == 0)
+  }
+
+  private def getFailoverMode(request: RequestChannel.Request): String = {
+    
+    if (!isFailoverListener(request))
+      s"ACTIVE"
+    else
+      failoverMode
   }
 
   private def forwardToController(request: RequestChannel.Request): Unit = {
@@ -167,6 +188,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         throw new IllegalStateException(s"API ${request.header.apiKey} with version ${request.header.apiVersion} is not enabled")
       }
 
+      // warn(s"### Handling Request with Api Key: ${request.header.apiKey}")
       request.header.apiKey match {
         case ApiKeys.PRODUCE => handleProduceRequest(request, requestLocal)
         case ApiKeys.FETCH => handleFetchRequest(request)
@@ -351,8 +373,15 @@ class KafkaApis(val requestChannel: RequestChannel,
   ): CompletableFuture[Unit] = {
     val offsetCommitRequest = request.body[OffsetCommitRequest]
 
+    if (getFailoverMode(request) == s"ACTIVATING") {
+      requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(Errors.OPERATION_NOT_ATTEMPTED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (getFailoverMode(request) == s"STANDBY") {
+      requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    }
     // Reject the request if not authorized to the group.
-    if (!authHelper.authorize(request.context, READ, GROUP, offsetCommitRequest.data.groupId)) {
+    else if (!authHelper.authorize(request.context, READ, GROUP, offsetCommitRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, offsetCommitRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
@@ -476,6 +505,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     val unauthorizedTopicResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
     val nonExistingTopicResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
     val invalidRequestResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
+    val notLeaderResponses = mutable.Map[TopicIdPartition, PartitionResponse]()
     val authorizedRequestInfo = mutable.Map[TopicIdPartition, MemoryRecords]()
     val topicIdToPartitionData = new mutable.ArrayBuffer[(TopicIdPartition, ProduceRequestData.PartitionProduceData)]
 
@@ -497,13 +527,16 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
     // cache the result to avoid redundant authorization calls
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC, topicIdToPartitionData)(_._1.topic)
+    val failover = getFailoverMode(request)
 
     topicIdToPartitionData.foreach { case (topicIdPartition, partition) =>
       // This caller assumes the type is MemoryRecords and that is true on current serialization
       // We cast the type to avoid causing big change to code base.
       // https://issues.apache.org/jira/browse/KAFKA-10698
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
-      if (!authorizedTopics.contains(topicIdPartition.topic))
+      if (failover == s"EVACUATING" || failover == s"ACTIVATING")
+        notLeaderResponses += topicIdPartition -> new PartitionResponse(Errors.NOT_LEADER_OR_FOLLOWER)
+      else if (!authorizedTopics.contains(topicIdPartition.topic) || failover == s"STANDBY")
         unauthorizedTopicResponses += topicIdPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
       else if (!metadataCache.contains(topicIdPartition.topicPartition))
         nonExistingTopicResponses += topicIdPartition -> new PartitionResponse(Errors.UNKNOWN_TOPIC_OR_PARTITION)
@@ -523,7 +556,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     // https://issues.apache.org/jira/browse/KAFKA-10730
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicIdPartition, PartitionResponse]): Unit = {
-      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
+      val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses ++ notLeaderResponses
       var errorInResponse = false
 
       val nodeEndpoints = new mutable.HashMap[Int, Node]
@@ -560,6 +593,7 @@ class KafkaApis(val requestChannel: RequestChannel,
       val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request.session, request.header.clientId(), requestSize, timeMs)
       val requestThrottleTimeMs =
         if (produceRequest.acks == 0) 0
+        else if (getFailoverMode(request) == s"ACTIVATING") Math.max(1000, quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs))
         else quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
       val maxThrottleTimeMs = Math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
       if (maxThrottleTimeMs > 0) {
@@ -667,6 +701,14 @@ class KafkaApis(val requestChannel: RequestChannel,
           erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
         }
       }
+    } else if (getFailoverMode(request) == s"EVACUATING") {
+      fetchContext.foreachPartition { (topicIdPartition, _) =>
+        erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.NOT_LEADER_OR_FOLLOWER)
+      }
+    } else if (getFailoverMode(request) == s"STANDBY") {
+      fetchContext.foreachPartition { (topicIdPartition, _) =>
+        erroneous += topicIdPartition -> FetchResponse.partitionResponse(topicIdPartition, Errors.TOPIC_AUTHORIZATION_FAILED)
+      }
     } else {
       // Regular Kafka consumers need READ permission on each partition they are fetching.
       val partitionDatas = new mutable.ArrayBuffer[(TopicIdPartition, FetchRequest.PartitionData)]
@@ -766,7 +808,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         // quotas. When throttled, we unrecord the recorded bandwidth quota value.
         val responseSize = fetchContext.getResponseSize(partitions, versionId)
         val timeMs = time.milliseconds()
-        val requestThrottleTimeMs = quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+        val requestThrottleTimeMs = math.max(quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs), if (getFailoverMode(request) == s"ACTIVATING") 1000 else 0)
         val bandwidthThrottleTimeMs = quotas.fetch.maybeRecordAndGetThrottleTimeMs(request.session, request.header.clientId(), responseSize, timeMs)
 
         val maxThrottleTimeMs = math.max(bandwidthThrottleTimeMs, requestThrottleTimeMs)
@@ -948,6 +990,12 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleTopicMetadataRequest(request: RequestChannel.Request): Unit = {
     val metadataRequest = request.body[MetadataRequest]
     val requestVersion = request.header.apiVersion
+
+    if (getFailoverMode(request) == s"EVACUATING" && metadataRequest.version >= 13) {
+      requestHelper.sendErrorResponseMaybeThrottle(request, Errors.REBOOTSTRAP_REQUIRED.exception)
+      info(s"MetadataRequest: returning REBOOTSTRAP_REQUIRED")
+      return
+    }
 
     // Topic IDs are not supported for versions 10 and 11. Topic names can not be null in these versions.
     if (!metadataRequest.isAllTopics) {
@@ -1310,6 +1358,9 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   private def getCoordinator(request: RequestChannel.Request, keyType: Byte, key: String): (Errors, Node) = {
+    if (getFailoverMode(request) == s"ACTIVATING") {
+      return (Errors.COORDINATOR_NOT_AVAILABLE, Node.noNode)
+    }
     if (keyType == CoordinatorType.GROUP.id &&
         !authHelper.authorize(request.context, DESCRIBE, GROUP, key))
       (Errors.GROUP_AUTHORIZATION_FAILED, Node.noNode)
@@ -1447,7 +1498,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   ): CompletableFuture[Unit] = {
     val joinGroupRequest = request.body[JoinGroupRequest]
 
-    if (!authHelper.authorize(request.context, READ, GROUP, joinGroupRequest.data.groupId)) {
+    val failover = getFailoverMode(request)
+    if (failover == s"EVACUATING") {
+      requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.NOT_COORDINATOR.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (failover == s"STANDBY") {
+      requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (!authHelper.authorize(request.context, READ, GROUP, joinGroupRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, joinGroupRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
@@ -1534,7 +1592,10 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleHeartbeatRequest(request: RequestChannel.Request): CompletableFuture[Unit] = {
     val heartbeatRequest = request.body[HeartbeatRequest]
 
-    if (!authHelper.authorize(request.context, READ, GROUP, heartbeatRequest.data.groupId)) {
+    if (getFailoverMode(request) == s"EVACUATING") {
+      requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(Errors.NOT_COORDINATOR.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (!authHelper.authorize(request.context, READ, GROUP, heartbeatRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, heartbeatRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
@@ -1592,7 +1653,9 @@ class KafkaApis(val requestChannel: RequestChannel,
     // ApiVersionRequest is not available.
     def createResponseCallback(requestThrottleMs: Int): ApiVersionsResponse = {
       val apiVersionRequest = request.body[ApiVersionsRequest]
-      if (apiVersionRequest.hasUnsupportedRequestVersion) {
+      if (getFailoverMode(request) == s"STANDBY") {
+        apiVersionRequest.getErrorResponse(requestThrottleMs, Errors.CLUSTER_AUTHORIZATION_FAILED.exception)
+      } else if (apiVersionRequest.hasUnsupportedRequestVersion) {
         apiVersionRequest.getErrorResponse(requestThrottleMs, Errors.UNSUPPORTED_VERSION.exception)
       } else if (!apiVersionRequest.isValid) {
         apiVersionRequest.getErrorResponse(requestThrottleMs, Errors.INVALID_REQUEST.exception)
@@ -2429,7 +2492,14 @@ class KafkaApis(val requestChannel: RequestChannel,
   ): CompletableFuture[Unit] = {
     val offsetDeleteRequest = request.body[OffsetDeleteRequest]
 
-    if (!authHelper.authorize(request.context, DELETE, GROUP, offsetDeleteRequest.data.groupId)) {
+    val failover = getFailoverMode(request)
+    if (failover == s"ACTIVATING") {
+      requestHelper.sendMaybeThrottle(request, offsetDeleteRequest.getErrorResponse(Errors.OPERATION_NOT_ATTEMPTED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (failover == s"STANDBY") {
+      requestHelper.sendMaybeThrottle(request, offsetDeleteRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
+      CompletableFuture.completedFuture[Unit](())
+    } else if (!authHelper.authorize(request.context, DELETE, GROUP, offsetDeleteRequest.data.groupId)) {
       requestHelper.sendMaybeThrottle(request, offsetDeleteRequest.getErrorResponse(Errors.GROUP_AUTHORIZATION_FAILED.exception))
       CompletableFuture.completedFuture[Unit](())
     } else {
