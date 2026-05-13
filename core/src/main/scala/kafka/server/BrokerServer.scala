@@ -161,6 +161,8 @@ class BrokerServer(
   var sharePartitionManager: SharePartitionManager = _
 
   var persister: Persister = _
+  
+  var brokerLinker: BrokerLinker = _
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
@@ -526,6 +528,13 @@ class BrokerServer(
         () => lifecycleManager.resendBrokerRegistration())
       metadataPublishers.add(brokerRegistrationTracker)
 
+	  // TODO: check all inputs!
+      brokerLinker = new BrokerLinker(config, time, startupDeadline, metrics, _replicaManager, 
+        logManager = logManager, 
+      	quotaManagers = quotaManagers,
+        logDirFailureChannel = logDirFailureChannel,
+        brokerTopicStats = brokerTopicStats)
+      brokerLinker.targetMetadataPublisher.foreach(metadataPublishers.add(_))
 
       // Register parts of the broker that can be reconfigured via dynamic configs.  This needs to
       // be done before we publish the dynamic configs, so that we don't miss anything.
@@ -597,6 +606,8 @@ class BrokerServer(
         shutdown()
         throw if (e.isInstanceOf[ExecutionException]) e.getCause else e
     }
+
+    brokerLinker.maybeStartup()
   }
 
   private def createGroupCoordinator(): GroupCoordinator = {
@@ -724,6 +735,9 @@ class BrokerServer(
     try {
       val deadline = time.milliseconds() + timeout.toMillis
       info("shutting down")
+
+	  if (brokerLinker != null)
+	  	brokerLinker.shutdown()
 
       if (config.controlledShutdownEnable) {
         if (replicaManager != null)

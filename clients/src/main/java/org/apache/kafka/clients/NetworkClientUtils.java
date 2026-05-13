@@ -113,6 +113,7 @@ public final class NetworkClientUtils {
                         if (response.versionMismatch() != null) {
                             throw response.versionMismatch();
                         }
+System.out.println("Response=" + response.toString());
                         return response;
                     }
                 }
