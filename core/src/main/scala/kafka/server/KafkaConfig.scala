@@ -41,7 +41,7 @@ import org.apache.kafka.raft.{KRaftConfigs, MetadataLogConfig, QuorumConfig}
 import org.apache.kafka.security.authorizer.AuthorizerUtils
 import org.apache.kafka.server.ProcessRole
 import org.apache.kafka.server.authorizer.Authorizer
-import org.apache.kafka.server.config.{AbstractKafkaConfig, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs, DynamicBrokerConfig => JDynamicBrokerConfig}
+import org.apache.kafka.server.config.{AbstractKafkaConfig, QuotaConfig, ReplicationConfigs, ServerConfigs, ServerLogConfigs, ClusterLinkConfigs, DynamicBrokerConfig => JDynamicBrokerConfig}
 import org.apache.kafka.server.log.remote.storage.RemoteLogManagerConfig
 import org.apache.kafka.server.metrics.MetricConfigs
 
@@ -161,6 +161,9 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
 
   private val _quotaConfig = new QuotaConfig(this)
   def quotaConfig: QuotaConfig = _quotaConfig
+
+  private val _clusterLinkConfig = new ClusterLinkConfigs(this)
+  def clusterLinkConfig: ClusterLinkConfigs = _clusterLinkConfig
 
   /** ********* General Configuration ***********/
   val brokerSessionTimeoutMs: Int = getInt(KRaftConfigs.BROKER_SESSION_TIMEOUT_MS_CONFIG)
@@ -593,6 +596,16 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     require(principalBuilderClass != null, s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must be non-null")
     require(classOf[KafkaPrincipalSerde].isAssignableFrom(principalBuilderClass),
       s"${BrokerSecurityConfigs.PRINCIPAL_BUILDER_CLASS_CONFIG} must implement KafkaPrincipalSerde")
+      
+    // Cluster Link Configuration
+    if (clusterLinkConfig.mode != ClusterLinkConfigs.LinkMode.Active.toString() &&
+        clusterLinkConfig.mode != ClusterLinkConfigs.LinkMode.Standby.toString()) {
+      throw new IllegalArgumentException(s"${ClusterLinkConfigs.CLUSTER_LINK_MODE_CONFIG} contains invalid value : ${clusterLinkConfig.mode}")
+    }
+    if (clusterLinkConfig.mode == ClusterLinkConfigs.LinkMode.Standby.toString()) {
+    	require(clusterLinkConfig.sourceClusterId.nonEmpty, s"${ClusterLinkConfigs.CLUSTER_LINK_SOURCE_CLUSTER_ID_CONFIG} must be provided")
+    	require(!clusterLinkConfig.sourceQuorumBootstrapServers.isEmpty, s"${ClusterLinkConfigs.CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_CONFIG} must be provided")
+    }
   }
 
   /**
