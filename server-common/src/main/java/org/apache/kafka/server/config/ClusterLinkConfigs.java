@@ -68,6 +68,11 @@ public class ClusterLinkConfigs {
     public static final List<String> CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_DEFAULT = List.of();
     public static final String CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_DOC = "Bootstrap servers of the source quorum cluster";
 
+    public static final String CLUSTER_LINK_LISTENER_NAMES_CONFIG = CLUSTER_LINK_PREFIX + "listener.names";
+    public static final List<String> CLUSTER_LINK_LISTENER_NAMES_DEFAULT = List.of();
+    public static final String CLUSTER_LINK_LISTENER_NAMES_DOC = "A comma-separated list of the names of the listeners used by the link observer. This is required " +
+            "when the cluster is used as Cluster Link Standby.";
+
     public static final String CLUSTER_LINK_OBSERVER_NODE_ID_CONFIG = CLUSTER_LINK_PREFIX + "observer.node.id";
     public static final int CLUSTER_LINK_OBSERVER_NODE_ID_DEFAULT = 5000; 
     public static final String CLUSTER_LINK_OBSERVER_NODE_ID_DOC = "Node id of this node when observing the source quorum cluster";
@@ -80,12 +85,14 @@ public class ClusterLinkConfigs {
             .define(CLUSTER_LINK_MODE_CONFIG, STRING, CLUSTER_LINK_MODE_DEFAULT, HIGH, CLUSTER_LINK_MODE_DOC)
             .define(CLUSTER_LINK_SOURCE_CLUSTER_ID_CONFIG, STRING, CLUSTER_LINK_SOURCE_CLUSTER_ID_DEFAULT, HIGH, CLUSTER_LINK_SOURCE_CLUSTER_ID_DOC)
             .define(CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_CONFIG, LIST, CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_DEFAULT, new ClusterLinkBootstrapServersValidator(), HIGH, CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_DOC)
+            .define(CLUSTER_LINK_LISTENER_NAMES_CONFIG, LIST, CLUSTER_LINK_LISTENER_NAMES_DEFAULT, ConfigDef.ValidList.anyNonDuplicateValues(true, false), HIGH, CLUSTER_LINK_LISTENER_NAMES_DOC)
             .define(CLUSTER_LINK_OBSERVER_NODE_ID_CONFIG, INT, CLUSTER_LINK_OBSERVER_NODE_ID_DEFAULT, atLeast(1000), HIGH, CLUSTER_LINK_OBSERVER_NODE_ID_DOC)
             .define(CLUSTER_LINK_METADATA_LOG_SUB_DIR_CONFIG, STRING, CLUSTER_LINK_METADATA_LOG_SUB_DIR_DEFAULT, HIGH, CLUSTER_LINK_METADATA_LOG_SUB_DIR_DOC);
 
     private final String mode;
     private final String sourceClusterId;
     private final List<String> sourceQuorumBootstrapServers;
+    private final List<String> listenerNames;
     private final int observerNodeId;
     private final String metadataLogSubDir;
 
@@ -93,6 +100,7 @@ public class ClusterLinkConfigs {
     	this.mode = abstractConfig.getString(CLUSTER_LINK_MODE_CONFIG);
     	this.sourceClusterId = abstractConfig.getString(CLUSTER_LINK_SOURCE_CLUSTER_ID_CONFIG);
         this.sourceQuorumBootstrapServers = abstractConfig.getList(CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_CONFIG);
+        this.listenerNames = abstractConfig.getList(CLUSTER_LINK_LISTENER_NAMES_CONFIG);
         this.observerNodeId = abstractConfig.getInt(CLUSTER_LINK_OBSERVER_NODE_ID_CONFIG);
         this.metadataLogSubDir = abstractConfig.getString(CLUSTER_LINK_METADATA_LOG_SUB_DIR_CONFIG);
     }
@@ -108,7 +116,11 @@ public class ClusterLinkConfigs {
     public List<String> sourceQuorumBootstrapServers() {
         return sourceQuorumBootstrapServers;
     }
-    
+
+    public List<String> listenerNames() {
+        return listenerNames;
+    }
+
     public int observerNodeId() {
     	return observerNodeId;
     }

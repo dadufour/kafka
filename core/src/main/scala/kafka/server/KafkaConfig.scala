@@ -605,6 +605,14 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _])
     if (clusterLinkConfig.mode == ClusterLinkConfigs.LinkMode.Standby.toString()) {
     	require(clusterLinkConfig.sourceClusterId.nonEmpty, s"${ClusterLinkConfigs.CLUSTER_LINK_SOURCE_CLUSTER_ID_CONFIG} must be provided")
     	require(!clusterLinkConfig.sourceQuorumBootstrapServers.isEmpty, s"${ClusterLinkConfigs.CLUSTER_LINK_SOURCE_QUORUM_BOOTSTRAP_SERVERS_CONFIG} must be provided")
+    	require(!clusterLinkConfig.listenerNames.isEmpty, s"${ClusterLinkConfigs.CLUSTER_LINK_LISTENER_NAMES_CONFIG} must be provided")
+        clusterLinkConfig.listenerNames.forEach { name =>
+          val listenerName = ListenerName.normalised(name)
+          if (!effectiveListenerSecurityProtocolMap.containsKey(listenerName)) {
+            throw new ConfigException(s"Observer listener with name ${listenerName.value} defined in " +
+              s"${ClusterLinkConfigs.CLUSTER_LINK_LISTENER_NAMES_CONFIG} not found in ${SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG}")
+          }
+        }
     }
   }
 
