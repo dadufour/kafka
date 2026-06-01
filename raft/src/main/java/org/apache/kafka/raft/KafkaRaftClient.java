@@ -479,16 +479,26 @@ public final class KafkaRaftClient<T> implements RaftClient<T> {
     }
 
     public void initialize(
+            Map<Integer, InetSocketAddress> voterAddresses,
+            QuorumStateStore quorumStateStore,
+            Metrics metrics,
+            ExternalKRaftMetrics externalKRaftMetrics
+        ) {
+    	initialize(voterAddresses, quorumStateStore, metrics, externalKRaftMetrics, "raft");
+    }
+    
+    public void initialize(
         Map<Integer, InetSocketAddress> voterAddresses,
         QuorumStateStore quorumStateStore,
         Metrics metrics,
-        ExternalKRaftMetrics externalKRaftMetrics
+        ExternalKRaftMetrics externalKRaftMetrics,
+        String prefix
     ) {
         VoterSet staticVoters = voterAddresses.isEmpty() ?
             VoterSet.empty() :
             VoterSet.fromInetSocketAddresses(channel.listenerName(), voterAddresses);
 
-        kafkaRaftMetrics = new KafkaRaftMetrics(metrics, "raft");
+        kafkaRaftMetrics = new KafkaRaftMetrics(metrics, prefix);
 
         partitionState = new KRaftControlRecordStateMachine(
             staticVoters,

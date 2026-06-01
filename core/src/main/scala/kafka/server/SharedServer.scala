@@ -19,6 +19,7 @@ package kafka.server
 
 import kafka.metrics.KafkaMetricsReporter
 import kafka.raft.KafkaRaftManager
+import kafka.raft.KafkaRaftObserver
 import kafka.server.Server.MetricsPrefix
 import kafka.utils.{Logging, VerifiableProperties}
 import org.apache.kafka.common.metrics.Metrics
@@ -34,9 +35,10 @@ import org.apache.kafka.image.publisher.metrics.SnapshotEmitterMetrics
 import org.apache.kafka.image.publisher.{SnapshotEmitter, SnapshotGenerator}
 import org.apache.kafka.metadata.{SupportedConfigChecker, ListenerInfo, MetadataRecordSerde}
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble
-import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics}
+import org.apache.kafka.network.SocketServerConfigs
+import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, KRaftConfigs}
 import org.apache.kafka.server.{ProcessRole, ServerSocketFactory}
-import org.apache.kafka.server.config.DefaultSupportedConfigChecker
+import org.apache.kafka.server.config.{DefaultSupportedConfigChecker, ServerConfigs, ReplicationConfigs, ClusterLinkConfigs}
 import org.apache.kafka.server.common.ApiMessageAndVersion
 import org.apache.kafka.server.fault.{FaultHandler, LoggingFaultHandler, ProcessTerminatingFaultHandler}
 import org.apache.kafka.server.metrics.{BrokerServerMetrics, KafkaYammerMetrics, NodeMetrics}
@@ -121,8 +123,10 @@ class SharedServer(
 
   @volatile var metrics: Metrics = _metrics
   @volatile var raftManager: KafkaRaftManager[ApiMessageAndVersion] = _
+  @volatile var raftObserver: KafkaRaftObserver[ApiMessageAndVersion] = _
   @volatile var brokerMetrics: BrokerServerMetrics = _
   @volatile var controllerServerMetrics: ControllerMetadataMetrics = _
+  @volatile var observerServerMetrics: ControllerMetadataMetrics = _
   @volatile var nodeMetrics: NodeMetrics = _
   @volatile var loader: MetadataLoader = _
   private val snapshotsDisabledReason = new AtomicReference[String](null)
@@ -167,6 +171,7 @@ class SharedServer(
           .asJava
       )
       start(endpoints)
+      maybeBuildRaftObserver()
     }
     usedByController = true
   }
@@ -187,12 +192,74 @@ class SharedServer(
   def stopForController(): Unit = synchronized {
     if (usedByController) {
       usedByController = false
+      Option(raftObserver).foreach(_raftObserver => {
+      	Utils.swallow(this.logger.underlying, () => _raftObserver.shutdown())
+      	raftObserver = null
+      })
       if (!isUsed()) stop()
     }
   }
 
+  private def maybeBuildRaftObserver(): Unit = {
+  
+  	  if (sharedServerConfig.processRoles.contains(ProcessRole.ControllerRole) &&
+  	      sharedServerConfig.clusterLinkConfig.mode == ClusterLinkConfigs.LinkMode.Standby.toString()) {
+
+        logger.info("Building a RaftObserver with Id {} and bootstrap address {}",
+	        sharedServerConfig.clusterLinkConfig.observerNodeId,
+        	sharedServerConfig.clusterLinkConfig.sourceQuorumBootstrapServers.toString()
+        )
+
+      	// Change the logdir and nodeId for observer 
+	    val origProps = sharedServerConfig.originals()
+        origProps.put(ServerConfigs.BROKER_ID_CONFIG, f"${sharedServerConfig.clusterLinkConfig.observerNodeId}")	// Override Broker/Node Ids
+        origProps.put(KRaftConfigs.NODE_ID_CONFIG, f"${sharedServerConfig.clusterLinkConfig.observerNodeId}")		// Override Broker/Node Ids
+        origProps.put(KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG, sharedServerConfig.clusterLinkConfig.listenerNames) // Override listener
+        origProps.put(KRaftConfigs.PROCESS_ROLES_CONFIG, "broker")													// Must behave as an observer (=broker)
+        origProps.put("controller.quorum.bootstrap.servers", sharedServerConfig.clusterLinkConfig.sourceQuorumBootstrapServers)
+        origProps.put(SocketServerConfigs.LISTENERS_CONFIG, "DUMMY://:9999")										// Not used but required for consistency checks!
+        origProps.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG, "DUMMY://nowhere:9999")						// Not used but required for consistency checks!
+        origProps.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "DUMMY")								// Not used but required for consistency checks!
+        origProps.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG, 
+        			  origProps.get(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG)+",DUMMY:PLAINTEXT")	// Required for consistency checks!
+        val observerConfig = KafkaConfig.apply(origProps, false)
+
+        observerServerMetrics = new ControllerMetadataMetrics(Optional.of(KafkaYammerMetrics.defaultRegistry()))
+       
+        val externalKRaftMetrics: ExternalKRaftMetrics = ignoredStaticVoters => {
+          Option(observerServerMetrics).foreach(_.setIgnoredStaticVoters(ignoredStaticVoters))
+        }
+      
+        raftObserver = new KafkaRaftObserver[ApiMessageAndVersion](
+          observerConfig.clusterLinkConfig.sourceClusterId,
+          observerConfig,
+          metaPropsEnsemble.logDirProps.get(metaPropsEnsemble.metadataLogDir.get).directoryId.get, 
+          new MetadataRecordSerde,
+          KafkaRaftServer.MetadataPartition,
+          KafkaRaftServer.MetadataTopicId,
+          time,
+          metrics,
+          externalKRaftMetrics,
+          Some(s"kafka-${observerConfig.nodeId}-raft"), 		// No dash expected at the end
+          CompletableFuture.completedFuture(JMap.of()), 		// Not used
+          ClusterLinkConfigs.parseBootstrapServers(observerConfig.clusterLinkConfig.sourceQuorumBootstrapServers),
+          Endpoints.empty(),									// Not used
+          raftObserverFaultHandler
+        )
+        
+        // Build a starter to start and stop based the controller leadership
+  		raftObserver.buildStarter(raftManager, sharedServerConfig.nodeId)
+      }
+  }
+  
   private def raftManagerFaultHandler: FaultHandler = faultHandlerFactory.build(
     name = "raft manager",
+    fatal = true,
+    action = () => {}
+  )
+
+  private def raftObserverFaultHandler: FaultHandler = faultHandlerFactory.build(
+    name = "raft observer",
     fatal = true,
     action = () => {}
   )
@@ -382,6 +449,10 @@ class SharedServer(
       debug("SharedServer is not running.")
     } else {
       info("Stopping SharedServer")
+      if (observerServerMetrics != null) {
+      	Utils.closeQuietly(observerServerMetrics, "observer server metrics")
+        observerServerMetrics = null
+      }
       if (loader != null) {
         Utils.swallow(this.logger.underlying, () => loader.beginShutdown())
       }
