@@ -483,8 +483,8 @@ public final class KafkaRaftClient<T> implements RaftClient<T> {
             QuorumStateStore quorumStateStore,
             Metrics metrics,
             ExternalKRaftMetrics externalKRaftMetrics
-        ) {
-    	initialize(voterAddresses, quorumStateStore, metrics, externalKRaftMetrics, "raft");
+    ) {
+        initialize(voterAddresses, quorumStateStore, metrics, externalKRaftMetrics, "raft");
     }
     
     public void initialize(

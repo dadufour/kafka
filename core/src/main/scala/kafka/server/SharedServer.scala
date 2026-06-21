@@ -241,9 +241,7 @@ class SharedServer(
           metrics,
           externalKRaftMetrics,
           Some(s"kafka-${observerConfig.nodeId}-raft"), 		// No dash expected at the end
-          CompletableFuture.completedFuture(JMap.of()), 		// Not used
           ClusterLinkConfigs.parseBootstrapServers(observerConfig.clusterLinkConfig.sourceQuorumBootstrapServers),
-          Endpoints.empty(),									// Not used
           raftObserverFaultHandler
         )
         
