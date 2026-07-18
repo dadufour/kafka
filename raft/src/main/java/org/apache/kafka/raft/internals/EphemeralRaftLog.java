@@ -94,12 +94,16 @@ public class EphemeralRaftLog implements RaftLog {
             TopicPartition topicPartition,
             Uuid topicId,
             int nodeId,
+            long restartOffset,
             boolean autoclean) {
         this.topicPartition = topicPartition;
         this.topicId = topicId;
         this.logIdent = "[RaftLog (Observer) nodeId=" + nodeId + "] ";
         this.logger = new LogContext(logIdent).logger(EphemeralRaftLog.class);
         this.autoclean = autoclean;
+        this.startOffset = restartOffset;
+        this.endOffset = restartOffset;
+        this.highWatermark = new LogOffsetMetadata(restartOffset);
     }
 
     @Override
@@ -599,12 +603,14 @@ public class EphemeralRaftLog implements RaftLog {
     public static EphemeralRaftLog createLog(
             TopicPartition topicPartition,
             Uuid topicId,
-            int nodeId) {
+            int nodeId,
+            long restartOffset) {
 
         return createLog(
                 topicPartition,
                 topicId,
                 nodeId,
+                restartOffset,
                 true);
     }
 
@@ -612,12 +618,14 @@ public class EphemeralRaftLog implements RaftLog {
             TopicPartition topicPartition,
             Uuid topicId,
             int nodeId,
+            long restartOffset,
             boolean autoClean) {
 
         EphemeralRaftLog metadataLog = new EphemeralRaftLog(
                 topicPartition,
                 topicId,
                 nodeId,
+                restartOffset,
                 autoClean
         );
 

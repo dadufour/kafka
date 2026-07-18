@@ -17,21 +17,26 @@
 package kafka.raft
 
 import java.net.InetSocketAddress
-import java.util.{OptionalInt, Collection => JCollection, Map => JMap}
+import java.util.{Optional, OptionalInt, Collection => JCollection, Map => JMap}
 import kafka.server.KafkaConfig
 import kafka.utils.Logging
 import org.apache.kafka.clients.{ApiVersions, ManualMetadataUpdater, MetadataRecoveryStrategy, NetworkClient}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.Uuid
+// import org.apache.kafka.common.metadata.ObserverReplicationOffsetRecord;
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.network.{ChannelBuilders, ListenerName, NetworkReceive, Selectable, Selector}
 import org.apache.kafka.common.security.JaasContext
 import org.apache.kafka.common.security.auth.SecurityProtocol
 import org.apache.kafka.common.utils.{Time, Utils}
 import org.apache.kafka.common.utils.internals.LogContext
+import org.apache.kafka.image.publisher.MetadataPublisher
+import org.apache.kafka.image.loader.LoaderManifest
+import org.apache.kafka.image.{MetadataDelta, MetadataImage}
 import org.apache.kafka.raft.internals.EphemeralRaftLog
-import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, VoidQuorumStateStore, KafkaNetworkChannel, KafkaRaftClient, KafkaRaftClientDriver, QuorumConfig, RaftLog, TimingWheelExpirationService, RaftClient, RaftManager, BatchReader, LeaderAndEpoch}
+import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, VoidQuorumStateStore, KafkaNetworkChannel, KafkaRaftClient, KafkaRaftClientDriver, QuorumConfig, TimingWheelExpirationService, RaftClient, BatchReader, LeaderAndEpoch}
 import org.apache.kafka.server.ProcessRole
+// import org.apache.kafka.server.common.ApiMessageAndVersion
 import org.apache.kafka.server.common.Feature
 import org.apache.kafka.server.common.serialization.RecordSerde
 import org.apache.kafka.server.fault.FaultHandler
@@ -57,18 +62,37 @@ class KafkaRaftObserver[T](
 ) extends Logging {
 
   val apiVersions = new ApiVersions()
+  val observerReplicationOffsetPublisher: MetadataPublisher = new ObserverReplicationOffsetPublisher()
+  private var observerReplicationOffsetCache: Long = 0L
   private val raftConfig = new QuorumConfig(config)
   private val threadNamePrefix = threadNamePrefixOpt.getOrElse("kafka-raft")
   private val logContext = new LogContext(s"[RaftObserver id=${config.nodeId}] ")
   this.logIdent = logContext.logPrefix()
+  private var installLeadershipListenerAction: () => Unit = _
 
 
+  //=============================================================
+  // Everything from the Observer that needs to get built each time
+  // The Observer is started. The Observer should be active ONLY when
+  // the associated local Controller is LEADER. So each time the
+  // leadership changes, the Observer needs to be stopped/started.
+  //=============================================================
   private class RunningObserver() {
   
+    private val raftLog = buildMetadataLog(KafkaRaftObserver.this.observerReplicationOffsetCache)
     private val netChannel = buildNetworkChannel()
     private val client: KafkaRaftClient[T] = buildRaftClient()
     private val clientDriver = new KafkaRaftClientDriver[T](client, threadNamePrefix, fatalFaultHandler, logContext)
-    
+
+    private def buildMetadataLog(observerReplicationOffset: Long): EphemeralRaftLog = {
+      EphemeralRaftLog.createLog(
+        topicPartition,
+        topicId,
+        config.nodeId,
+        observerReplicationOffset
+      )
+    }
+
     private def buildRaftClient(): KafkaRaftClient[T] = {
       val client = new KafkaRaftClient(
         OptionalInt.of(config.nodeId),
@@ -168,12 +192,13 @@ class KafkaRaftObserver[T](
     def stop(): Unit = {
       clientDriver.shutdown()
       netChannel.close()
+      raftLog.close()
     }
     
   }
+  //=============================================================
 
   private var runningObserver: RunningObserver = _
-  private val raftLog: RaftLog = buildMetadataLog()
   private val expirationTimer = new SystemTimer("raft-expiration-executor")
   private val expirationService = new TimingWheelExpirationService(expirationTimer)
 
@@ -199,25 +224,27 @@ class KafkaRaftObserver[T](
   	stop()
     Utils.swallow(this.logger.underlying, () => expirationService.shutdown())
     Utils.closeQuietly(expirationTimer, "expiration timer")
-    Utils.closeQuietly(raftLog, "raft log")
   }
 
-  private def buildMetadataLog(): RaftLog = {
-    EphemeralRaftLog.createLog(
-      topicPartition,
-      topicId,
-      config.nodeId
-    )
-  }
-
-
-  // Starter of this instance by listening on a Controller Raft manager
-  def buildStarter[U](controllerRaftManager: RaftManager[U],
+  def buildStarter[U](raftClient: RaftClient[U],
     				  controllerId: Int
     				  ): Unit = {
-    	controllerRaftManager.client.register(new RaftLeadershipListener[U](controllerId))
+    	// The Listener can't be started immediately: to start from the correct
+    	// replication offset, the Observer should first have a MetadataListener
+    	// installed on the local metadata log of the local controller to know
+    	// that offset. If this Listener is installed too early, the Observer
+    	// may start before this replication offset is known. As a consequence,
+    	// the installation of this listener will be deferred up to the point
+    	// we have received at least once the metadata log of the local controller
+    	installLeadershipListenerAction = () => { raftClient.register(new RaftLeadershipListener[U](controllerId)) }
   }
   
+  //=============================================================
+  // A Client Listener that listens to the local leader controller
+  // One instance will be running constantly to detect change of
+  // leadership in the local quorum to start/stop the observer
+  // accordingly
+  //=============================================================
   private class RaftLeadershipListener[U](
     val controllerId: Int
   ) extends RaftClient.Listener[U] {
@@ -226,6 +253,8 @@ class KafkaRaftObserver[T](
       if (newLeaderAndEpoch.isLeader(controllerId)) {
         if (KafkaRaftObserver.this.isRunning() == false) {
             KafkaRaftObserver.this.logger.info("Starting RaftObserver because controller {} became leader", controllerId)
+            KafkaRaftObserver.this.logger.info("Replication offset is {}", KafkaRaftObserver.this.observerReplicationOffsetCache)
+
         	KafkaRaftObserver.this.startup()
         }
       } else {
@@ -248,31 +277,58 @@ class KafkaRaftObserver[T](
     	reader.close()
     }
   }
+  //=============================================================
   
-  
+  //=============================================================
+  // A Client Listener that listens to the remote leader controller
+  // A new instance will be created each time the observer is
+  // (re)started.
+  //=============================================================
   private class RaftObserverListener(
   ) extends RaftClient.Listener[T] {
 
     override def handleLeaderChange(newLeaderAndEpoch: LeaderAndEpoch): Unit = {
     }
 
+    private def translate(inputRecord: T): Optional[T] = {
+        return Optional.empty()
+    }
+    
     override def handleCommit(reader: BatchReader[T]): Unit = {
     
       	var lastOffset: Long = -1;
+      	
       	try {
         	while (reader.hasNext()) {
             	val batch = reader.next();
-            
             	lastOffset = batch.lastOffset();
+                batch.forEach { record =>
+                  val localRecord = translate(record)
+                  if (localRecord.isPresent) {
+                    KafkaRaftObserver.this.logger.info("present")
+                  }
+                }
         	}
       	} finally {
         	reader.close();
       	}
+      	
       	if (lastOffset >= 0) {
         	KafkaRaftObserver.this.logger.info("new replication offset {}", lastOffset)
+        	// buildOffsetRecord(lastOffset)
       	}
     }
 
+/*
+    private def buildOffsetRecord(offset: Long): ApiMessageAndVersion = {
+        new ApiMessageAndVersion(
+            new ObserverReplicationOffsetRecord()
+                .setReplicationOffset(offset)
+                .setPrimaryClusterId(Uuid.fromString(clusterId)),
+            0
+        )
+    } */
+    
     override def handleLoadSnapshot(reader: SnapshotReader[T]): Unit = {
     	reader.close()
     }
@@ -281,5 +337,45 @@ class KafkaRaftObserver[T](
     	reader.close()
     }
   }
+  //=============================================================
   
+  //=============================================================
+  // A Metadata publisher to capture the Observer replication offset
+  // in a metadata log of a controller
+  //=============================================================
+  private class ObserverReplicationOffsetPublisher(
+  ) extends MetadataPublisher {
+  
+    override def name(): String = s"ObserverReplicationOffsetPublisher id=${config.nodeId}"
+
+    // default void onControllerChange(LeaderAndEpoch newLeaderAndEpoch) { }
+
+    override def onMetadataUpdate(
+      delta: MetadataDelta,
+      newImage: MetadataImage,
+      manifest: LoaderManifest
+    ): Unit = {
+
+      // Update the replication offset cache so that if the Observer is started,
+      // it is starting from this offset
+      if (newImage.observer.clusterId() == KafkaRaftObserver.this.clusterId) {
+        if (newImage.observer.replicationOffset().isPresent()) {
+          KafkaRaftObserver.this.observerReplicationOffsetCache = newImage.observer.replicationOffset().getAsLong()
+        }
+      }
+
+      // Now that the cache had a chance to get populated from the controller local log
+      // the observer can be started
+      if (installLeadershipListenerAction != null) {
+        KafkaRaftObserver.this.logger.info("Metadata of local controller received - installing the leadership listener")
+        KafkaRaftObserver.this.logger.info("Replication offset is {}", KafkaRaftObserver.this.observerReplicationOffsetCache)
+
+        installLeadershipListenerAction()
+        // The listener should be installed only once
+        installLeadershipListenerAction = null
+      }
+      
+    }
+  }
+  //=============================================================
 }

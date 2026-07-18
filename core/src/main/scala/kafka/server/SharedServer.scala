@@ -32,7 +32,7 @@ import org.apache.kafka.image.MetadataProvenance
 import org.apache.kafka.image.loader.MetadataLoader
 import org.apache.kafka.image.loader.metrics.MetadataLoaderMetrics
 import org.apache.kafka.image.publisher.metrics.SnapshotEmitterMetrics
-import org.apache.kafka.image.publisher.{SnapshotEmitter, SnapshotGenerator}
+import org.apache.kafka.image.publisher.{MetadataPublisher, SnapshotEmitter, SnapshotGenerator}
 import org.apache.kafka.metadata.{SupportedConfigChecker, ListenerInfo, MetadataRecordSerde}
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble
 import org.apache.kafka.network.SocketServerConfigs
@@ -44,7 +44,8 @@ import org.apache.kafka.server.fault.{FaultHandler, LoggingFaultHandler, Process
 import org.apache.kafka.server.metrics.{BrokerServerMetrics, KafkaYammerMetrics, NodeMetrics}
 
 import java.net.InetSocketAddress
-import java.util.Arrays
+import java.util.ArrayList
+import java.util.List
 import java.util.Optional
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.{CompletableFuture, TimeUnit}
@@ -170,8 +171,8 @@ class SharedServer(
           .toMap
           .asJava
       )
-      start(endpoints)
       maybeBuildRaftObserver()
+      start(endpoints)
     }
     usedByController = true
   }
@@ -244,9 +245,6 @@ class SharedServer(
           ClusterLinkConfigs.parseBootstrapServers(observerConfig.clusterLinkConfig.sourceQuorumBootstrapServers),
           raftObserverFaultHandler
         )
-        
-        // Build a starter to start and stop based the controller leadership
-  		raftObserver.buildStarter(raftManager, sharedServerConfig.nodeId)
       }
   }
   
@@ -413,7 +411,12 @@ class SharedServer(
           setThreadNamePrefix(s"kafka-${sharedServerConfig.nodeId}-").
           build()
         try {
-          loader.installPublishers(Arrays.asList(snapshotGenerator)).get()
+          val publishers: List[MetadataPublisher] = new ArrayList[MetadataPublisher]()
+          publishers.add(snapshotGenerator)
+          Option(raftObserver).foreach(_raftObserver => {
+            publishers.add(_raftObserver.observerReplicationOffsetPublisher)
+          })
+          loader.installPublishers(publishers).get()
         } catch {
           case t: Throwable => {
             error("Unable to install metadata publishers", t)
@@ -421,6 +424,12 @@ class SharedServer(
           }
         }
         _raftManager.client.register(loader)
+        
+        // Build a starter to start and stop based the controller leadership
+        Option(raftObserver).foreach(_raftObserver => {
+            _raftObserver.buildStarter(raftManager.client, sharedServerConfig.nodeId)
+        })
+
         debug("Completed SharedServer startup.")
         started = true
       } catch {
