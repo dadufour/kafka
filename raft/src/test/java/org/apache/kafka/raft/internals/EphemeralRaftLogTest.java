@@ -679,8 +679,6 @@ public class EphemeralRaftLogTest {
 
     private static EphemeralRaftLog buildMetadataLog() {
         return EphemeralRaftLog.createLog(
-                Topic.CLUSTER_METADATA_TOPIC_PARTITION,
-                Uuid.METADATA_TOPIC_ID,
                 1,
                 0L
         );
@@ -688,8 +686,6 @@ public class EphemeralRaftLogTest {
 
     private static EphemeralRaftLog buildMetadataLog(boolean autoClean) {
         return EphemeralRaftLog.createLog(
-                Topic.CLUSTER_METADATA_TOPIC_PARTITION,
-                Uuid.METADATA_TOPIC_ID,
                 1,
                 0L,
                 autoClean

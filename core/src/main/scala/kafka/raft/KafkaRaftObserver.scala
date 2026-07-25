@@ -16,12 +16,10 @@
  */
 package kafka.raft
 
-import java.net.InetSocketAddress
-import java.util.{Optional, OptionalInt, Collection => JCollection, Map => JMap}
+import java.util.{Optional, OptionalInt, Map => JMap}
 import kafka.server.KafkaConfig
 import kafka.utils.Logging
 import org.apache.kafka.clients.{ApiVersions, ManualMetadataUpdater, MetadataRecoveryStrategy, NetworkClient}
-import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.Uuid
 // import org.apache.kafka.common.metadata.ObserverReplicationOffsetRecord;
 import org.apache.kafka.common.metrics.Metrics
@@ -34,46 +32,80 @@ import org.apache.kafka.image.publisher.MetadataPublisher
 import org.apache.kafka.image.loader.LoaderManifest
 import org.apache.kafka.image.{MetadataDelta, MetadataImage}
 import org.apache.kafka.raft.internals.EphemeralRaftLog
-import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, VoidQuorumStateStore, KafkaNetworkChannel, KafkaRaftClient, KafkaRaftClientDriver, QuorumConfig, TimingWheelExpirationService, RaftClient, BatchReader, LeaderAndEpoch}
+import org.apache.kafka.raft.{Endpoints, ExternalKRaftMetrics, VoidQuorumStateStore, KafkaNetworkChannel, KafkaRaftClient, KafkaRaftClientDriver, QuorumConfig, TimingWheelExpirationService, RaftClient, BatchReader, LeaderAndEpoch, KRaftConfigs}
+import org.apache.kafka.server.config.{ReplicationConfigs, ServerConfigs}
 import org.apache.kafka.server.ProcessRole
 // import org.apache.kafka.server.common.ApiMessageAndVersion
-import org.apache.kafka.server.common.Feature
+import org.apache.kafka.network.SocketServerConfigs
 import org.apache.kafka.server.common.serialization.RecordSerde
-import org.apache.kafka.server.fault.FaultHandler
+import org.apache.kafka.server.common.Feature
+import org.apache.kafka.server.config.ClusterLinkConfigs
+import org.apache.kafka.server.fault.ProcessTerminatingFaultHandler
 import org.apache.kafka.server.util.timer.SystemTimer
 import org.apache.kafka.snapshot.SnapshotReader
 
 import scala.jdk.CollectionConverters._
 
+//=============================================================
+// The KafkaRaftObserver is a bridge between 2 different Kraft
+// metadata log.
+// It is part of KRaft Controllers.
+// It consumes the metadata of a DISTINCT KRaft cluster and
+// filters/replicates/transforms metadata events into the local
+// KRaft cluster.
+// It is active only when:
+//   - the local cluster has Linking activated
+//   - the hosting controller is Leader
+// Therefore this class is activated/deactivated according to
+// the leader role of the hosting controller.
+//=============================================================
+object KafkaRaftObserver {
 
+  // The KafkaRaftObserver is built on the ability of the KafkaRaftClient
+  // to be used from Brokers as simple metadata consumer.
+  // We need to tweak the Controller config to make it suitable for this purpose.
+  private def observerConfigFromControllerConfig(controllerConfig: KafkaConfig): KafkaConfig = {
+  
+    // Change the logdir and nodeId for observer 
+    val origProps = controllerConfig.originals()
+    origProps.put(ServerConfigs.BROKER_ID_CONFIG, f"${controllerConfig.clusterLinkConfig.observerNodeId}")    // Override Broker/Node Ids
+    origProps.put(KRaftConfigs.NODE_ID_CONFIG, f"${controllerConfig.clusterLinkConfig.observerNodeId}")       // Override Broker/Node Ids
+    origProps.put(KRaftConfigs.CONTROLLER_LISTENER_NAMES_CONFIG, controllerConfig.clusterLinkConfig.listenerNames) // Override listener
+    origProps.put(KRaftConfigs.PROCESS_ROLES_CONFIG, "broker")                                                // Must behave as an observer (=broker)
+    origProps.put("controller.quorum.bootstrap.servers", controllerConfig.clusterLinkConfig.sourceQuorumBootstrapServers)
+    origProps.put(SocketServerConfigs.LISTENERS_CONFIG, "DUMMY://:9999")                                      // Not used but required for consistency checks!
+    origProps.put(SocketServerConfigs.ADVERTISED_LISTENERS_CONFIG, "DUMMY://nowhere:9999")                    // Not used but required for consistency checks!
+    origProps.put(ReplicationConfigs.INTER_BROKER_LISTENER_NAME_CONFIG, "DUMMY")                              // Not used but required for consistency checks!
+    origProps.put(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG, 
+                  origProps.get(SocketServerConfigs.LISTENER_SECURITY_PROTOCOL_MAP_CONFIG)+",DUMMY:PLAINTEXT") // Required for consistency checks!
+    KafkaConfig.apply(origProps, false)
+  }
+}
+//=============================================================
+
+//=============================================================
 class KafkaRaftObserver[T](
-  clusterId: String,
-  config: KafkaConfig,
-  metadataLogDirUuid: Uuid,
+  private val _config: KafkaConfig,
   serde: RecordSerde[T],
-  topicPartition: TopicPartition,
-  topicId: Uuid,
   time: Time,
-  metrics: Metrics,
-  externalKRaftMetrics: ExternalKRaftMetrics,
-  threadNamePrefixOpt: Option[String],
-  bootstrapServers: JCollection[InetSocketAddress],
-  fatalFaultHandler: FaultHandler
+  metrics: Metrics
 ) extends Logging {
 
-  val apiVersions = new ApiVersions()
-  val observerReplicationOffsetPublisher: MetadataPublisher = new ObserverReplicationOffsetPublisher()
+  private val config = KafkaRaftObserver.observerConfigFromControllerConfig(_config)
+  val sourceClusterId = config.clusterLinkConfig.sourceClusterId
+  val sourceBootstrapServers = ClusterLinkConfigs.parseBootstrapServers(config.clusterLinkConfig.sourceQuorumBootstrapServers)
+  private val observerReplicationOffsetPublisher = new ObserverReplicationOffsetPublisher()
+  val replicationOffsetPublisher: MetadataPublisher = observerReplicationOffsetPublisher
   private var observerReplicationOffsetCache: Long = 0L
   private val raftConfig = new QuorumConfig(config)
-  private val threadNamePrefix = threadNamePrefixOpt.getOrElse("kafka-raft")
+  private val threadNamePrefix = s"kafka-observer"
   private val logContext = new LogContext(s"[RaftObserver id=${config.nodeId}] ")
   this.logIdent = logContext.logPrefix()
-  private var installLeadershipListenerAction: () => Unit = _
 
 
   //=============================================================
   // Everything from the Observer that needs to get built each time
-  // The Observer is started. The Observer should be active ONLY when
+  // the Observer is started. The Observer should be active ONLY when
   // the associated local Controller is LEADER. So each time the
   // leadership changes, the Observer needs to be stopped/started.
   //=============================================================
@@ -82,12 +114,13 @@ class KafkaRaftObserver[T](
     private val raftLog = buildMetadataLog(KafkaRaftObserver.this.observerReplicationOffsetCache)
     private val netChannel = buildNetworkChannel()
     private val client: KafkaRaftClient[T] = buildRaftClient()
-    private val clientDriver = new KafkaRaftClientDriver[T](client, threadNamePrefix, fatalFaultHandler, logContext)
+    private val clientDriver = new KafkaRaftClientDriver[T](client, 
+            threadNamePrefix, 
+            new ProcessTerminatingFaultHandler.Builder().build(), 
+            logContext)
 
     private def buildMetadataLog(observerReplicationOffset: Long): EphemeralRaftLog = {
       EphemeralRaftLog.createLog(
-        topicPartition,
-        topicId,
         config.nodeId,
         observerReplicationOffset
       )
@@ -96,7 +129,7 @@ class KafkaRaftObserver[T](
     private def buildRaftClient(): KafkaRaftClient[T] = {
       val client = new KafkaRaftClient(
         OptionalInt.of(config.nodeId),
-        metadataLogDirUuid,
+        Uuid.randomUuid(),            // There is no physical Metadata Log Dir (because of EphemeralRaftLog) so we provide a random Uuid 
         serde,
         netChannel,
         raftLog,
@@ -105,8 +138,8 @@ class KafkaRaftObserver[T](
         logContext,
         // Controllers should always flush the log on replication because they may become voters
         config.processRoles.contains(ProcessRole.ControllerRole),
-        clusterId,
-        bootstrapServers,
+        sourceClusterId,
+        sourceBootstrapServers,
         Endpoints.empty(),									// localListeners: Not used
         Feature.KRAFT_VERSION.supportedVersionRange(),
         raftConfig
@@ -169,7 +202,7 @@ class KafkaRaftObserver[T](
         config.connectionSetupTimeoutMaxMs,
         time,
         discoverBrokerVersions,
-        apiVersions,
+        new ApiVersions(),
         logContext,
         MetadataRecoveryStrategy.NONE
       )
@@ -182,8 +215,10 @@ class KafkaRaftObserver[T](
           JMap.of(),					// Not used: controllerQuorumVoters
           new VoidQuorumStateStore(),	// Not used: void implementation
           metrics,
-  	      externalKRaftMetrics,
-	      s"observer"
+          new ExternalKRaftMetrics {    // Not used: void implementation
+            override def setIgnoredStaticVoters(ignoredStaticVoters: Boolean): Unit = ()
+          },
+          s"observer"
       )
       netChannel.start()
       clientDriver.start()
@@ -221,7 +256,8 @@ class KafkaRaftObserver[T](
   }
 
   def shutdown(): Unit = {
-  	stop()
+    logger.info("Shutting down Observer")
+    stop()
     Utils.swallow(this.logger.underlying, () => expirationService.shutdown())
     Utils.closeQuietly(expirationTimer, "expiration timer")
   }
@@ -229,14 +265,15 @@ class KafkaRaftObserver[T](
   def buildStarter[U](raftClient: RaftClient[U],
     				  controllerId: Int
     				  ): Unit = {
-    	// The Listener can't be started immediately: to start from the correct
-    	// replication offset, the Observer should first have a MetadataListener
-    	// installed on the local metadata log of the local controller to know
-    	// that offset. If this Listener is installed too early, the Observer
+    	// The Listener on the remote cluster can't be started immediately: 
+    	// to start from the correct replication offset, the Observer should 
+    	// first have a MetadataListener installed on the local metadata log 
+    	// of the local controller to know that offset. 
+    	// If this Listener is installed too early, the Observer
     	// may start before this replication offset is known. As a consequence,
     	// the installation of this listener will be deferred up to the point
     	// we have received at least once the metadata log of the local controller
-    	installLeadershipListenerAction = () => { raftClient.register(new RaftLeadershipListener[U](controllerId)) }
+    	observerReplicationOffsetPublisher.installLeadershipListenerAction = () => { raftClient.register(new RaftLeadershipListener[U](controllerId)) }
   }
   
   //=============================================================
@@ -324,7 +361,7 @@ class KafkaRaftObserver[T](
         new ApiMessageAndVersion(
             new ObserverReplicationOffsetRecord()
                 .setReplicationOffset(offset)
-                .setPrimaryClusterId(Uuid.fromString(clusterId)),
+                .setPrimaryClusterId(Uuid.fromString(sourceClusterId)),
             0
         )
     } */
@@ -343,38 +380,40 @@ class KafkaRaftObserver[T](
   // A Metadata publisher to capture the Observer replication offset
   // in a metadata log of a controller
   //=============================================================
-  private class ObserverReplicationOffsetPublisher(
-  ) extends MetadataPublisher {
+  private class ObserverReplicationOffsetPublisher() extends MetadataPublisher {
+
+    var installLeadershipListenerAction: () => Unit = _
   
     override def name(): String = s"ObserverReplicationOffsetPublisher id=${config.nodeId}"
 
-    // default void onControllerChange(LeaderAndEpoch newLeaderAndEpoch) { }
-
-    override def onMetadataUpdate(
-      delta: MetadataDelta,
-      newImage: MetadataImage,
-      manifest: LoaderManifest
-    ): Unit = {
+    override def onMetadataUpdate(delta: MetadataDelta,
+        newImage: MetadataImage,
+        manifest: LoaderManifest): Unit = {
 
       // Update the replication offset cache so that if the Observer is started,
       // it is starting from this offset
-      if (newImage.observer.clusterId() == KafkaRaftObserver.this.clusterId) {
+      if (newImage.observer.clusterId() == sourceClusterId) {
         if (newImage.observer.replicationOffset().isPresent()) {
           KafkaRaftObserver.this.observerReplicationOffsetCache = newImage.observer.replicationOffset().getAsLong()
         }
       }
-
+      
       // Now that the cache had a chance to get populated from the controller local log
       // the observer can be started
+      if (installLeadershipListenerAction != null)
+        installLeadershipListener()
+    }
+    
+    private def installLeadershipListener(): Unit = synchronized {
+
       if (installLeadershipListenerAction != null) {
-        KafkaRaftObserver.this.logger.info("Metadata of local controller received - installing the leadership listener")
-        KafkaRaftObserver.this.logger.info("Replication offset is {}", KafkaRaftObserver.this.observerReplicationOffsetCache)
+        logger.info("Installing the controller leadership listener")
+        logger.info("Replication offset is {}", observerReplicationOffsetCache)
 
         installLeadershipListenerAction()
         // The listener should be installed only once
         installLeadershipListenerAction = null
       }
-      
     }
   }
   //=============================================================

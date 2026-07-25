@@ -68,7 +68,7 @@ public class EphemeralRaftLog implements RaftLog {
     // leaderEpoch → firstOffsetOfEpoch
     private final InMemoryEpochCache epochCache = new InMemoryEpochCache();
 
-    // Snapshot tracking ──────────────────────────────────────────────
+    // ── Snapshot tracking ──────────────────────────────────────────────
     private Optional<OffsetAndEpoch> latestSnapshotId = Optional.empty();
 
     // ── Offset bookkeeping ──────────────────────────────────────────
@@ -79,8 +79,7 @@ public class EphemeralRaftLog implements RaftLog {
     private LogOffsetMetadata highWatermark = new LogOffsetMetadata(0L);
 
     // ── Metadata ────────────────────────────────────────────────────
-    private final TopicPartition topicPartition;
-    private final Uuid topicId;
+    private final TopicPartition topicPartition = new TopicPartition("__observer_fake_topic", 0);
     
     private final Logger logger;
     private final String logIdent;
@@ -91,13 +90,9 @@ public class EphemeralRaftLog implements RaftLog {
 
 
     private EphemeralRaftLog(
-            TopicPartition topicPartition,
-            Uuid topicId,
             int nodeId,
             long restartOffset,
             boolean autoclean) {
-        this.topicPartition = topicPartition;
-        this.topicId = topicId;
         this.logIdent = "[RaftLog (Observer) nodeId=" + nodeId + "] ";
         this.logger = new LogContext(logIdent).logger(EphemeralRaftLog.class);
         this.autoclean = autoclean;
@@ -432,11 +427,15 @@ public class EphemeralRaftLog implements RaftLog {
 
     @Override
     public boolean truncateToLatestSnapshot() {
+        // Snapshots are not supported by the implementation
+        // But still we keep track to move offsets which allows
+        // for memory cleanup
         if (latestSnapshotId.isPresent()) {
             startOffset = latestSnapshotId.get().offset();
             if (startOffset >= endOffset) endOffset = startOffset;
         }
         highWatermark = new LogOffsetMetadata(endOffset);
+        // Cleanup may be deactivated for test purposes
         if (autoclean) trimMemory();
         return false;
     }
@@ -495,7 +494,8 @@ public class EphemeralRaftLog implements RaftLog {
 
     @Override
     public Uuid topicId() {
-        return topicId;
+        // Should not be used in our context
+        return Uuid.METADATA_TOPIC_ID;
     }
 
     @Override
@@ -550,43 +550,50 @@ public class EphemeralRaftLog implements RaftLog {
     public Optional<RawSnapshotWriter> createNewSnapshotUnchecked(OffsetAndEpoch snapshotId) {
         epochCache.assign(snapshotId.epoch(), snapshotId.offset());
         latestSnapshotId = Optional.of(snapshotId);
+        // Snapshots are not supported by the implementation
         return Optional.empty();
     }
 
     @Override
     public Optional<RawSnapshotReader> readSnapshot(OffsetAndEpoch snapshotId) {
+        // Snapshots are not supported by the implementation
         return Optional.empty();
     }
 
     @Override
     public Optional<RawSnapshotReader> latestSnapshot() {
+        // Snapshots are not supported by the implementation
         return Optional.empty();
     }
 
     @Override
     public Optional<OffsetAndEpoch> latestSnapshotId() {
-        // return latestSnapshotId;
-        // last Snapshot Id is only kept for internal purposes
-        // but from user, this implementation does not handle any snapshot
+        // Snapshots are not supported by the implementation
+        // Last Snapshot Id is only kept for internal purposes
         return Optional.empty();
     }
 
     @Override
     public Optional<OffsetAndEpoch> earliestSnapshotId() {
+        // Snapshots are not supported by the implementation
         return Optional.empty();
     }
 
     @Override
     public void onSnapshotFrozen(OffsetAndEpoch snapshotId) {
+        // Snapshots are not supported by the implementation
     }
 
     @Override
     public boolean deleteBeforeSnapshot(OffsetAndEpoch snapshotId) {
+        // Snapshots are not supported by the implementation
         return false;
     }
 
     @Override
     public boolean maybeClean() {
+        // Do some internal cleanup to keep memory bounded
+        // Returned value used for tests only
         return trimMemory();
     }
 
@@ -597,33 +604,24 @@ public class EphemeralRaftLog implements RaftLog {
         highWatermark = new LogOffsetMetadata(0L);
         startOffset = 0L;
         endOffset   = 0L;
-
     }
 
     public static EphemeralRaftLog createLog(
-            TopicPartition topicPartition,
-            Uuid topicId,
             int nodeId,
             long restartOffset) {
 
         return createLog(
-                topicPartition,
-                topicId,
                 nodeId,
                 restartOffset,
                 true);
     }
 
     public static EphemeralRaftLog createLog(
-            TopicPartition topicPartition,
-            Uuid topicId,
             int nodeId,
             long restartOffset,
             boolean autoClean) {
 
         EphemeralRaftLog metadataLog = new EphemeralRaftLog(
-                topicPartition,
-                topicId,
                 nodeId,
                 restartOffset,
                 autoClean

@@ -19,6 +19,7 @@ package kafka.server
 
 import kafka.network.SocketServer
 import kafka.raft.KafkaRaftManager
+import kafka.raft.KafkaRaftObserver
 import kafka.server.QuotaFactory.QuotaManagers
 import kafka.server.metadata.{ClientQuotaMetadataManager, DynamicConfigPublisher, KRaftMetadataCachePublisher}
 
@@ -36,7 +37,7 @@ import org.apache.kafka.common.{ClusterResource, Endpoint, Uuid}
 import org.apache.kafka.controller.metrics.{ControllerMetadataMetricsPublisher, QuorumControllerMetrics}
 import org.apache.kafka.controller.{Controller, QuorumController, QuorumFeatures}
 import org.apache.kafka.image.publisher.{ControllerRegistrationsPublisher, MetadataPublisher}
-import org.apache.kafka.metadata.{KafkaConfigSchema, KRaftMetadataCache, ListenerInfo}
+import org.apache.kafka.metadata.{KafkaConfigSchema, KRaftMetadataCache, ListenerInfo, MetadataRecordSerde}
 import org.apache.kafka.metadata.authorizer.ClusterMetadataAuthorizer
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata
 import org.apache.kafka.metadata.publisher.{AclPublisher, DelegationTokenPublisher, DynamicClientQuotaPublisher, DynamicTopicClusterQuotaPublisher, FeaturesPublisher, ScramPublisher}
@@ -46,7 +47,7 @@ import org.apache.kafka.server.{ProcessRole, SimpleApiVersionManager}
 import org.apache.kafka.server.authorizer.Authorizer
 import org.apache.kafka.server.config.ServerLogConfigs.{ALTER_CONFIG_POLICY_CLASS_NAME_CONFIG, CREATE_TOPIC_POLICY_CLASS_NAME_CONFIG}
 import org.apache.kafka.server.common.{ApiMessageAndVersion, KRaftVersion, NodeToControllerChannelManager}
-import org.apache.kafka.server.config.ConfigType
+import org.apache.kafka.server.config.{ConfigType, ClusterLinkConfigs}
 import org.apache.kafka.server.config.DelegationTokenManagerConfigs
 import org.apache.kafka.server.controller.ControllerRegistrationManager
 import org.apache.kafka.server.metrics.{KafkaMetricsGroup, KafkaYammerMetrics, LinuxIoMetricsCollector}
@@ -113,6 +114,7 @@ class ControllerServer(
   @volatile var incarnationId: Uuid = _
   @volatile var registrationManager: ControllerRegistrationManager = _
   @volatile var registrationChannelManager: NodeToControllerChannelManager = _
+  @volatile var raftObserver: Option[KafkaRaftObserver[ApiMessageAndVersion]] = None
 
   private def maybeChangeStatus(from: ProcessStatus, to: ProcessStatus): Boolean = {
     lock.lock()
@@ -390,6 +392,27 @@ class ControllerServer(
         authorizerPlugin.toJava
       ))
 
+      // Set up Observer
+      if (config.clusterLinkConfig.mode == ClusterLinkConfigs.LinkMode.Standby.toString()) {
+
+        logger.info("Building a RaftObserver with Id {} and bootstrap address {}",
+            config.clusterLinkConfig.observerNodeId,
+            config.clusterLinkConfig.sourceQuorumBootstrapServers.toString())
+
+        raftObserver = Some(new KafkaRaftObserver[ApiMessageAndVersion](
+          config,
+          new MetadataRecordSerde,
+          time,
+          metrics))
+
+        // Register the observer to get metadata from local controller
+        metadataPublishers.add(raftObserver.get.replicationOffsetPublisher)
+        
+        // Build a starter to start and stop based the controller leadership
+        raftObserver.get.buildStarter(raftManager.client, config.nodeId)
+      }
+      
+
       // Install all metadata publishers.
       FutureUtils.waitWithLogging(logger.underlying, logIdent,
         "the controller metadata publishers to be installed",
@@ -485,6 +508,8 @@ class ControllerServer(
       socketServerFirstBoundPortFuture.completeExceptionally(new RuntimeException("shutting down"))
       Utils.swallow(this.logger.underlying, () => config.dynamicConfig.clear())
       sharedServer.stopForController()
+      raftObserver.foreach(observer => Utils.swallow(this.logger.underlying, () => observer.shutdown()))
+      raftObserver = None
     } catch {
       case e: Throwable =>
         fatal("Fatal error during controller shutdown.", e)
@@ -505,4 +530,5 @@ class ControllerServer(
       lock.unlock()
     }
   }
+
 }
